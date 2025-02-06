@@ -2,12 +2,16 @@ import os
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
 import openai
+import time
 
 # Set up authentication using environment variables
 CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REDIRECT_URI = "http://localhost:8888/callback"  # Required for user authentication
+
+if not CLIENT_ID or not CLIENT_SECRET:
+    raise ValueError("Spotify API credentials are missing! Set SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET.")
 
 # Authenticate with Spotify
 sp = None
@@ -26,29 +30,27 @@ def get_spotify_auth_client():
                                   scope="playlist-modify-public"))
 
 
-def get_spotify_query(user_request):
-    prompt = f"Given the user request '{user_request}', provide an appropriate search query for finding a track on Spotify that contains a high-quality performance of the requested classical piece, ensuring to include the correct opus number if applicable. Return only the query string."
-
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are an expert in classical music and Spotify searches."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        return response["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print("Error with OpenAI query generation:", e)
-        return user_request  # Fallback to user input
+def safe_openai_request(prompt, retries=3):
+    for attempt in range(retries):
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert in classical music and Spotify searches."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"Error on attempt {attempt + 1}: {e}")
+            time.sleep(2)
+    return None
 
 
 def search_tracks(track_query, limit=5):
     print("Doing track query:", track_query)
     spotify_client = get_spotify_client()
-    results = spotify_client.search(q=track_query, type='track', limit=limit)  # Retrieve multiple tracks
-    return results
+    return spotify_client.search(q=track_query, type='track', limit=limit)
 
 
 def get_album_from_track(track):
@@ -57,41 +59,27 @@ def get_album_from_track(track):
 
 def get_album_tracks(album_id):
     spotify_client = get_spotify_client()
-    tracks = spotify_client.album_tracks(album_id)
-    return tracks
+    return spotify_client.album_tracks(album_id)
 
 
-def filter_tracks_with_openai(tracks, user_request):
-    track_names = [track["name"] for track in tracks["items"]]
+def match_tracks_with_openai(user_request, album_tracks):
+    track_names = [track["name"] for track in album_tracks["items"]]
     if not track_names:
         return []
 
     prompt = (
-            f"Here is a list of tracks from a classical music album:\n"
-            + "\n".join(track_names) +
-            f"\n\nIdentify and return only the tracks that belong to the requested piece: '{user_request}', ensuring the opus number matches if applicable."
-            " Please return only the exact track names, separated by new lines."
+            f"Given the following album track list, identify the tracks that belong to the requested classical piece: '{user_request}'.\n"
+            "Ensure that the opus number matches if applicable.\n"
+            "Return only the exact track names, separated by new lines.\n\n"
+            "Track list:\n" + "\n".join(track_names)
     )
 
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a music expert trained in classical compositions."},
-                {"role": "user", "content": prompt}
-            ]
-        )
+    filtered_tracks_text = safe_openai_request(prompt)
+    if not filtered_tracks_text:
+        return []
 
-        filtered_tracks_text = response["choices"][0]["message"].get("content", "").strip()
-        print("OpenAI Response:\n", filtered_tracks_text)  # Debugging output
-
-        # Convert OpenAI response into a list of track names
-        filtered_tracks = [line.strip() for line in filtered_tracks_text.split("\n") if line.strip()]
-        return [track for track in tracks["items"] if track["name"] in filtered_tracks]
-
-    except Exception as e:
-        print("Error with OpenAI filtering:", e)
-        return []  # Return empty if OpenAI filtering fails
+    filtered_tracks = [line.strip() for line in filtered_tracks_text.split("\n") if line.strip()]
+    return [track for track in album_tracks["items"] if track["name"] in filtered_tracks]
 
 
 def create_spotify_playlist(user_id, playlist_name, track_uris):
@@ -100,14 +88,30 @@ def create_spotify_playlist(user_id, playlist_name, track_uris):
         return
 
     spotify_auth_client = get_spotify_auth_client()
-    playlist = spotify_auth_client.user_playlist_create(user=user_id, name=playlist_name, public=True)
-    spotify_auth_client.playlist_add_items(playlist_id=playlist["id"], items=track_uris)
-    print(f"Playlist created: {playlist['name']}, URL: {playlist['external_urls']['spotify']}")
+    playlists = spotify_auth_client.user_playlists(user_id)
+    existing_playlist = next((p for p in playlists["items"] if p["name"] == playlist_name), None)
+
+    if existing_playlist:
+        playlist_id = existing_playlist["id"]
+        print(f"Updating existing playlist: {playlist_name}")
+    else:
+        playlist = spotify_auth_client.user_playlist_create(user=user_id, name=playlist_name, public=True)
+        playlist_id = playlist["id"]
+        print(f"Created new playlist: {playlist_name}")
+
+    spotify_auth_client.playlist_add_items(playlist_id=playlist_id, items=track_uris)
+    print(
+        f"Playlist updated: {playlist_name}, URL: {spotify_auth_client.playlist(playlist_id)['external_urls']['spotify']}")
 
 
 # Get user input for the classical piece
 user_request = input("Enter the name of a classical piece: ")
-query = get_spotify_query(user_request)
+query = safe_openai_request(
+    f"Provide a search query for Spotify for: '{user_request}'. Be sure to include the opus number if available.")
+
+if not query:
+    print("Using fallback user input as query.")
+    query = user_request
 
 tracks = search_tracks(query)
 
@@ -115,16 +119,8 @@ for track in tracks["tracks"]["items"]:
     album = get_album_from_track(track)
     if album:
         print(f"Album: {album['name']}, URL: {album['external_urls']['spotify']}")
-
-        # Retrieve and filter tracks using OpenAI
         album_tracks = get_album_tracks(album['id'])
-        selected_tracks = filter_tracks_with_openai(album_tracks, user_request)
-
-        # Fallback: If OpenAI doesn't return results, use keyword matching
-        if not selected_tracks:
-            print("OpenAI filtering failed; using fallback matching...")
-            selected_tracks = [track for track in album_tracks["items"] if
-                               user_request.lower() in track["name"].lower()]
+        selected_tracks = match_tracks_with_openai(user_request, album_tracks)
 
         if len(selected_tracks) >= 3:
             print(f"Selected Tracks for '{user_request}':")
@@ -132,18 +128,13 @@ for track in tracks["tracks"]["items"]:
             for track in selected_tracks:
                 print(f"- {track['name']}")
 
-            # Create Spotify playlist only if tracks are found
-            if track_uris:
-                user_id = get_spotify_auth_client().current_user()["id"]
-                create_spotify_playlist(user_id, f"Classical Piece - {user_request}", track_uris)
-            else:
-                print("No valid tracks found for playlist creation.")
+            user_id = get_spotify_auth_client().current_user()["id"]
+            create_spotify_playlist(user_id, f"Classical Piece - {user_request}", track_uris)
             break
         else:
             print("Not enough movements found, trying next track...")
 
 
-# Ensure proper cleanup
 def cleanup():
     global sp
     if sp:
