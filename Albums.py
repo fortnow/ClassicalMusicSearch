@@ -31,16 +31,17 @@ def get_spotify_auth_client():
 
 
 def safe_openai_request(prompt, retries=3):
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
     for attempt in range(retries):
         try:
-            response = openai.ChatCompletion.create(
+            response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
                     {"role": "system", "content": "You are an expert in classical music and Spotify searches."},
                     {"role": "user", "content": prompt}
                 ]
             )
-            return response["choices"][0]["message"]["content"].strip()
+            return response.choices[0].message.content.strip()
         except Exception as e:
             print(f"Error on attempt {attempt + 1}: {e}")
             time.sleep(2)
